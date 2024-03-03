@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+
+<html>
+
+<head>
+    <title> Raw TCP HTTP 1.1 server </title>
+    <meta charset="UTF-8">
+    <meta name="author" content="Bloxxy">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+</head>
+
+<body>
+    <form action="/form">
+        <label for="firstname">First name:</label>
+        <input type="text" id="firstname" name="firstname">
+
+        <label for="birthdate">Birth date:</label>
+        <input type="datetime-local" id="birthdate" name="birthdate">
+
+        <label for="eyecolor">Eye color:</label>
+        <input type="color" id="eyecolor" name="eyecolor">
+
+        <label for="favphoto">Favorite photo:</label>
+        <input type="file" id="favphoto" name="favphoto">
+
+        <label for="favnumber">Favorite number:</label>
+        <input type="number" id="favnumber" name="favnumber">
+
+        <input type="submit" value="Submit" formenctype="multipart/form-data" formmethod="post">
+    </form>
+</body>
+
+<style>
+
+</style>
+
+<script>
+    document.querySelector("form").addEventListener("onsubmit", function(event){
+        event.preventDefault()
+    });
+</script>
+
+</html>
