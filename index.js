@@ -565,7 +565,7 @@ const parsers = {
 
         if (ContentType == `application/json`) {
             try {
-                request.body = JSON.parse(request.body);
+                request.body = JSON.parse(request.body.toString());
             } catch(err){
                 request.body = null;
             }

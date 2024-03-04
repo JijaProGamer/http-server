@@ -46,4 +46,4 @@ Will open a server on 127.0.0.1:8500, with a simple form.
 
 # Documentation
 
-All the documentation can be found in the [Page Wiki](https://pages.github.com/).
+All the documentation can be found in the [Page Wiki](https://github.com/JijaProGamer/http-server/wiki/httpServer-class).
