@@ -1,5 +1,7 @@
 const net = require("net")
 const fs = require("fs")
+const stream = require("stream")
+const wcmatch = require('wildcard-match')
 
 function parseString(value) {
     const dateValue = new Date(value);
@@ -126,14 +128,165 @@ const statusCodeTexts = {
     511: "Network Authentication Required"
 }
 
+class httpRequest {
+    host;
+    headers;
+    body;
+    method;
+    ip;
+    ips;
+    url;
+    cookies;
+}
+
+class httpResponse {
+    statusCode = 200;
+    isOpen =  true;
+    sentHeaders =  false;
+    headers =  {};
+    cookies =  {};
+
+    #socket;
+    #version;
+
+    constructor(socket, version){
+        this.#socket = socket;
+        this.#version = version;
+    }
+
+    sendHeaders() {
+        if (this.sentHeaders) {
+            throw new Error(`Unable to send headers multiple times.`)
+        }
+
+        if (!statusCodeTexts[this.statusCode]) {
+            throw new Error(`Invalid status code ${this.statusCode}.`);
+        }
+
+        if(Object.keys(this.cookies).length > 0 && !this.headers["set-cookie"]){
+            let setCookie = ``;
+
+            for(let [name, value] of Object.entries(this.cookies)){
+                setCookie += `${encodeURIComponent(name)}=${encodeURIComponent(value.value)}; SameSite=${value.sameSite}; Path=${value.path}; `
+
+                if(value.secure) setCookie += "Secure; ";
+                if(value.httpOnly) setCookie += "HttpOnly; ";
+                if(value.priority == "High") setCookie += "Priority=High; ";
+                if(value.domain) setCookie += `Domain=${value.domain}; `;
+                if(value.expires) setCookie += `Expires=${value.expires.toUTCString()}; `;
+            }
+
+            if (setCookie.endsWith('; ')) {
+                setCookie = setCookie.slice(0, -2);
+            }
+
+            this.headers["Set-Cookie"] = setCookie;
+        }
+
+        let headersMessage = `${this.#version} ${this.statusCode} ${statusCodeTexts[this.statusCode]}\r\n`
+        Object.keys(this.headers).forEach(header => {
+            headersMessage += `${header.toLowerCase()}: ${this.headers[header]}\r\n`;
+        })
+
+        headersMessage += `\r\n`;
+        this.#socket.write(headersMessage);
+        this.sentHeaders = true;
+    }
+
+    sendFile(filePath) {
+        fs.readFile(filePath, (err, data) => {
+            if (err) {
+                this.statusCode = 500;
+                return this.send(err.name + " " + err.message);
+            }
+
+            this.send(data);
+        })
+    }
+
+    send(message){
+        if (!this.isOpen) {
+            throw new Error("Unable to send message after socket closed.")
+        }
+
+        if (!this.sentHeaders){
+            this.sendHeaders()
+        }
+
+        if (message){
+            this.#socket.write(message);
+        }
+
+        this.#socket.end();
+    }
+
+    stream = new stream.Writable({
+        write: (chunk, encoding, callback) => {
+            if (!this.isOpen) {
+                throw new Error("Unable to send message after socket closed.");
+            }
+
+            if (!this.sentHeaders) {
+                this.sendHeaders();
+            }
+
+            this.#socket.write(chunk, encoding);
+            callback();
+        },
+
+        final: (callback) => {
+            if (!this.isOpen) {
+                throw new Error("Unable to send message after socket closed.");
+            }
+
+            if (!this.sentHeaders) {
+                this.sendHeaders();
+            }
+
+            this.isOpen = false;
+            this.#socket.end();
+            callback();
+        },
+    });
+
+    end() {
+        if (!this.isOpen) {
+            throw new Error("Unable to send message after socket closed.")
+        }
+
+        if (!this.sentHeaders)
+        this.sendHeaders()
+
+        this.isOpen = false;
+        this.#socket.end();
+    }
+}
+
+class cookie {
+    value;
+    secure;
+    httpOnly;
+    priority;
+    domain;
+    path;
+    sameSite;
+    expires;
+}
+
 class httpServer {
     #tcpServer;
+    #middleware = [];
     #listeners = {
         GET: {},
         POST: {},
         DELETE: {},
+        HEAD: {},
+        PUT: {},
+        PATCH: {},
+        OPTIONS: {},
     };
-    #middleware = [];
+
+    trustProxy = false;
 
     constructor() {
         this.#tcpServer = net.createServer(this.#handleSocket.bind(this))
@@ -143,6 +296,8 @@ class httpServer {
         socket.on("data", (message) => {
             this.#handleSocketMessage(socket, message)
         })
+
+        socket.on("error", socket.end)
     }
 
     #handleSocketMessage(socket, message) {
@@ -172,31 +327,31 @@ class httpServer {
 
             charactersSkipped += line.length + 2;
             line = line.split(": ")
-            headers[line.shift()] = line.join(": ")
+            headers[line.shift().toLowerCase()] = line.join(": ")
         }
 
         let body = message.subarray(charactersSkipped, message.length)
         let ips = {
             socket: socket.remoteAddress,
             client: socket.remoteAddress,
-            proxies: []
+            proxy: ""
         }
 
-        if (headers["X-Forwarded-For"]) {
-            let proxies = headers["X-Forwarded-For"].split(", ")
+        if (headers["x-forwarded-for"] && this.trustProxy) {
+            let proxies = headers["x-forwarded-for"].split(", ")
 
             ips.client = proxies.shift();
-            ips.proxies = proxies;
+            ips.proxy = proxies.shift();
         }
 
         let cookies = {}
 
-        if(headers["Cookie"]){
-            let cookiesRaw = headers["Cookie"].split("; ")
+        if(headers["cookie"]){
+            let cookiesRaw = headers["cookie"].split("; ")
             let lastCookie;
 
-            for(let cookie of cookiesRaw){
-                let [name, value] = cookie.split("=")
+            for(let cookieRaw of cookiesRaw){
+                let [name, value] = cookieRaw.split("=")
                 name = decodeURIComponent(name)
 
                 if(name == "expires"){
@@ -228,122 +383,53 @@ class httpServer {
 
                     cookies[name].priority = value;
                 } else {
-                    cookies[name] = {
-                        value: decodeURIComponent(value),
-                        secure: false,
-                        httpOnly: false,
-                        priority: "",
-                        domain: "",
-                        path: "/",
-                        sameSite: "Lax",
-                        expires: new Date(0),
-                    }
+                    cookies[name] = new cookie();
+                    cookies[name].value = decodeURIComponent(value);
+                    cookies[name].secure = false;
+                    cookies[name].httpOnly = false;
+                    cookies[name].priority = "";
+                    cookies[name].domain = "";
+                    cookies[name].path ="/";
+                    cookies[name].sameSite = "Lax";
+                    cookies[name].expires = new Date(0);
 
                     lastCookie = name;
                 }
             }
         }
 
-        let request = {
-            host,
-            headers,
-            body,
-            method,
-            ip: socket.remoteAddress,
-            ips,
-            url: directory,
-            cookies: cookies
-        }
+        let response = new httpResponse(socket, version);
+        let request = new httpRequest();
 
-        let response = {
-            statusCode: 200,
-            isOpen: true,
-            sentHeaders: false,
-            headers: {},
-            cookies: {},
-
-            sendHeaders: () => {
-                if (response.sentHeaders) {
-                    throw new Error(`Unable to send headers multiple times.`)
-                }
-
-                if (!statusCodeTexts[response.statusCode]) {
-                    throw new Error(`Invalid status code ${response.statusCode}.`);
-                }
-
-                if(response.cookies && !response.headers["Set-Cookie"]){
-                    let setCookie = ``;
-
-                    for(let [name, value] of Object.entries(response.cookies)){
-                        setCookie += `${encodeURIComponent(name)}=${encodeURIComponent(value.value)}; SameSite=${value.sameSite}; Path=${value.path}; `
-
-                        if(value.secure) setCookie += "Secure; ";
-                        if(value.httpOnly) setCookie += "HttpOnly; ";
-                        if(value.priority == "High") setCookie += "Priority=High; ";
-                        if(value.domain) setCookie += `Domain=${value.domain}; `;
-                        if(value.expires) setCookie += `Expires=${value.expires.toUTCString()}; `;
-                    }
-
-                    if (setCookie.endsWith('; ')) {
-                        setCookie = setCookie.slice(0, -2);
-                    }
-
-                    response.headers["Set-Cookie"] = setCookie;
-                }
-
-                let headersMessage = `${version} ${response.statusCode} ${statusCodeTexts[response.statusCode]}\r\n`
-                Object.keys(response.headers).forEach(header => {
-                    headersMessage += `${header}: ${response.headers[header]}\r\n`;
-                })
-
-                headersMessage += `\r\n`;
-                socket.write(headersMessage);
-                response.sentHeaders = true;
-            },
-
-            sendFile: (filePath) => {
-                fs.readFile(filePath, "utf-8", (err, data) => {
-                    if (err) {
-                        response.statusCode = 500;
-                        return response.send(err.name + " " + err.message);
-                    }
-
-                    response.send(data);
-                })
-            },
-
-            send: (sendMessage) => {
-                if (!response.isOpen) {
-                    throw new Error("Unable to send message after socket closed.")
-                }
-
-                if (!response.sentHeaders)
-                    response.sendHeaders()
-
-                if (sendMessage)
-                    socket.write(sendMessage);
-
-                socket.end();
-            },
-
-            end: () => {
-                if (!response.isOpen) {
-                    throw new Error("Unable to send message after socket closed.")
-                }
-
-                if (!response.sentHeaders)
-                    response.sendHeaders()
-
-                response.isOpen = false;
-                socket.end();
-            }
-        }
+        request.body = body;
+        request.cookies = cookies;
+        request.headers = headers;
+        request.ips = ips;
+        request.ip = ips.client;
+        request.method = method;
+        request.url = directory;
+        request.host = host;
 
         callNextMiddleware.bind(this)(0);
         function callNextMiddleware(index) {
             if (!this.#middleware[index]) {
-                if (this.#listeners[method] && this.#listeners[method][directory]) {
-                    this.#listeners[method][directory](request, response)
+                if (this.#listeners[method]) {
+                    let listener = this.#listeners[method][directory];
+                    if(listener){
+                        listener(request, response)
+                    } else {
+                        let listeners = Object.keys(this.#listeners[method]);
+
+                        for(let listener of listeners){
+                            if(!listener.includes("*")) continue;
+                            let listenerMatch = wcmatch(listener)
+
+                            if(listenerMatch(directory)){
+                                this.#listeners[method][listener](request, response)
+                                break;
+                            }
+                        }
+                    }
                 }
 
                 return;
@@ -359,6 +445,26 @@ class httpServer {
 
     post(name, func) {
         this.#listeners.POST[name] = func;
+    }
+
+    put(name, func) {
+        this.#listeners.PUT[name] = func;
+    }
+
+    delete(name, func) {
+        this.#listeners.DELETE[name] = func;
+    }
+
+    head(name, func) {
+        this.#listeners.HEAD[name] = func;
+    }
+
+    options(name, func) {
+        this.#listeners.OPTIONS[name] = func;
+    }
+
+    patch(name, func) {
+        this.#listeners.PATCH[name] = func;
     }
 
     use(func) {
@@ -381,7 +487,7 @@ class httpServer {
 
 const parsers = {
     form: (request, response, next) => {
-        let ContentType = request.headers["Content-Type"]
+        let ContentType = request.headers["content-type"]
 
         if (ContentType) {
             let [type, boundary] = ContentType.split(";")
@@ -445,7 +551,7 @@ const parsers = {
               
                 pairs.forEach((pair) => {
                   const [key, value] = pair.split('=').map(decodeURIComponent);
-                  result[key] = value;
+                  result[key] = parseString(value);
                 });
               
                 request.body = result;
@@ -455,7 +561,7 @@ const parsers = {
         next()
     },
     json: (request, response, next) => {
-        let ContentType = request.headers["Content-Type"]
+        let ContentType = request.headers["content-type"]
 
         if (ContentType == `application/json`) {
             try {
@@ -469,4 +575,4 @@ const parsers = {
     }
 }
 
-module.exports = { httpServer, parsers };
+module.exports = { httpServer, parsers, cookie };
